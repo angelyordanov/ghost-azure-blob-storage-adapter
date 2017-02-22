@@ -1,6 +1,6 @@
 'use strict';
 
-// # S3 storage module for Ghost blog http://ghost.org/
+// # Azure blob storage module for Ghost blog http://ghost.org/
 
 var requireFromGhost = function(module, blocking) {
     try {
@@ -16,61 +16,51 @@ var requireFromGhost = function(module, blocking) {
     }
 };
 
-var fs = require('fs'),
-    path = require('path'),
+var path = require('path'),
     util = require('util'),
-    AWS = require('aws-sdk'),
+    azure = require('azure-storage'),
     Promise = require('bluebird'),
-    readFileAsync = Promise.promisify(fs.readFile),
     BaseStore = requireFromGhost("core/server/storage/base", false),
-    LocalFileStore = requireFromGhost("core/server/storage/local-file-store", false);
+    LocalFileStore = requireFromGhost("core/server/storage/local-file-store", false),
+    protocol = 'https',
+    domain = 'blob.core.windows.net';
 
-// Use Bluebird Promises in AWS
-AWS.config.setPromisesDependency(Promise);
-
-
-function S3Store(config) {
+function AzureBlobStore(config) {
     if (BaseStore) BaseStore.call(this);
-    this.config = config;
-    this.s3Client = null;
+    this.config = config || {};
+    this.config.storageAccount = this.config.storageAccount || process.env.AZURE_STORAGE_ACCOUNT;
+    this.config.accessKey = this.config.accessKey || process.env.AZURE_STORAGE_ACCESS_KEY;
+    this.blobSvc = null;
 }
 
-if (BaseStore) util.inherits(S3Store, BaseStore);
+if (BaseStore) util.inherits(AzureBlobStore, BaseStore);
 
-S3Store.prototype.getObjectURL = function(filename) {
-    var assetHost = this.config.assetHost;
-    if (!assetHost) {
-        var reagionSubdomain = (this.config.region == 'us-east-1') ? 's3' : 's3-' + this.config.region;
-        assetHost = 'https://' + reagionSubdomain + '.amazonaws.com/' + this.config.bucket + '/';
-    }
-    return assetHost + filename;
-};
+AzureBlobStore.prototype.initBlobService = function() {
+    if (!!this.config.storageAccount &&
+        !!this.config.accessKey &&
+        !!this.config.container) {
+        if (!this.blobSvc) {
+            var blobSvc = azure.createBlobService(this.config.storageAccount, this.config.accessKey);
+            this.createContainerIfNotExists = Promise.promisify(blobSvc.createContainerIfNotExists, { context: blobSvc });
+            this.createBlockBlobFromLocalFile = Promise.promisify(blobSvc.createBlockBlobFromLocalFile, { context: blobSvc });
+            this.getBlobProperties = Promise.promisify(blobSvc.getBlobProperties, { context: blobSvc, multiArgs: true });
+            this.deleteBlob = Promise.promisify(blobSvc.deleteBlob, { context: blobSvc });
 
-S3Store.prototype.initS3Client = function() {
-    if (!!this.config.accessKeyId &&
-        !!this.config.secretAccessKey &&
-        !!this.config.bucket &&
-        !!this.config.region) {
-        if (!this.s3Client) {
-            this.s3Client = new AWS.S3({
-                accessKeyId: this.config.accessKeyId,
-                secretAccessKey: this.config.secretAccessKey,
-                region: this.config.region
-            });
+            this.blobSvc = blobSvc;
         }
-        return this.s3Client;
+        return this.blobSvc;
     }
-    throw Error('ghost-s3 is not configured');
+    throw Error('ghost-azure-blob-storage is not configured');
 };
 
 // Implement BaseStore::save(image, targetDir)
-S3Store.prototype.save = function(image, targetDir) {
+AzureBlobStore.prototype.save = function(image, targetDir) {
     var self = this;
 
     targetDir = targetDir || this.getTargetDir();
 
     try {
-        this.initS3Client();
+        this.initBlobService();
     } catch (error) {
         return Promise.reject(error.message);
     }
@@ -79,56 +69,49 @@ S3Store.prototype.save = function(image, targetDir) {
     return this.getUniqueFileName(this, image, targetDir)
         .then(function(result) {
             filename = result;
-            return readFileAsync(image.path);
         })
-        .then(function (buffer) {
-            var params = {
-                ACL: 'public-read',
-                Bucket: self.config.bucket,
-                Key: filename,
-                Body: buffer,
-                ContentType: image.type,
-                CacheControl: 'max-age=' + (1000 * 365 * 24 * 60 * 60) // 365 days
-            };
-            return self.s3Client.putObject(params).promise();
+        .then(function () {
+            return self.createContainerIfNotExists(self.config.container, { publicAccessLevel: 'blob' });
+        })
+        .then(function () {
+            return self.createBlockBlobFromLocalFile(self.config.container, filename, image.path);
         })
         .tap(function() {
-            console.log('ghost-s3', 'Temp uploaded file path: ' + image.path);
+            console.log('ghost-azure-blob-storage', 'Temp uploaded file path: ' + image.path);
         })
-        .then(function(results) {
-            return Promise.resolve(self.getObjectURL(filename));
+        .then(function() {
+            var url = protocol + '://' + self.config.storageAccount + '.' + domain + '/' + self.config.container + '/' + filename;
+            return Promise.resolve(url);
         })
         .catch(function(err) {
-            console.error('ghost-s3', err);
+            console.error('ghost-azure-blob-storage', err);
             throw err;
         });
 };
 
 // Implement BaseStore::save(filename)
-S3Store.prototype.exists = function(filename) {
-    var params = {
-        Bucket: this.config.bucket,
-        Key: filename
-    };
-
+AzureBlobStore.prototype.exists = function(filename) {
     try {
-        this.initS3Client();
+        this.initBlobService();
     } catch (error) {
         return Promise.reject(error.message);
     }
 
-    return this.s3Client.headObject(params).promise()
-        .then(function(results) {
-            return Promise.resolve(true);
+    return this.getBlobProperties(this.config.container, filename)
+        .spread(function(properties, status) {
+            return Promise.resolve(status.isSuccessful);
         })
         .catch(function(err) {
-            return Promise.resolve(false);
+            if (err.statusCode === 404) {
+                return Promise.resolve(false);
+            }
+            return Promise.reject(err);
         });
 };
 
 // Implement BaseStore::serve(options)
 // middleware for serving the files
-S3Store.prototype.serve = function(options) {
+AzureBlobStore.prototype.serve = function(options) {
     options = options || {};
 
     // Preserve Theme download functionality
@@ -137,67 +120,70 @@ S3Store.prototype.serve = function(options) {
             return (new LocalFileStore()).serve(options);
         }
         return function(req, res, next) {
-            res.status(404);
+            res.send(404);
         };
     }
 
-    var s3Client;
     try {
-        s3Client = this.initS3Client();
+        this.initBlobService();
     } catch (err) {
         return function(req, res, next) {
-            console.error("ghost-s3", err);
-            res.status(500);
+            console.error("ghost-azure-blob-storage", err);
+            res.send(500);
         };
     }
 
     return function (req, res, next) {
-        var params = {
-            Bucket: this.config.bucket,
-            Key: req.path.replace(/^\//, '')
-        };
+        var filepath = req.path.replace(/^\//, '');
 
-        s3Client.getObject(params)
-            .on('httpHeaders', function(statusCode, headers, response) {
-                res.set(headers);
+        return this.getBlobProperties(this.config.container, filepath)
+            .spread(function(properties, status) {
+                if (!status.isSuccessful) {
+                    res.send(404);
+                } else {
+                    res.header('Content-Type', properties.contentType);
+                    self.blobSvc.createReadStream(this.config.container, filepath)
+                        .on('error', function(err) {
+                            console.error("ghost-azure-blob-storage", err);
+                            res.send(500);
+                        })
+                        .pipe(res);
+                }
             })
-            .createReadStream()
-            .on('error', function(err) {
-                console.error("ghost-s3", err);
-                res.status(404);
-                next();
-            })
-            .pipe(res);
+            .catch(function(err) {
+                if (err.statusCode === 404) {
+                    res.send(404);
+                } else {
+                    console.error("ghost-azure-blob-storage", err);
+                    res.send(500);
+                }
+            });
     };
 };
 
 // Implement BaseStore::delete(filename, targetDir)
-S3Store.prototype.delete = function(filename, targetDir) {
+AzureBlobStore.prototype.delete = function(filename, targetDir) {
     targetDir = targetDir || this.getTargetDir();
 
-    var pathToDelete = path.join(targetDir, filename);
+    var filepath = path.join(targetDir, filename);
 
     try {
-        this.initS3Client();
+        this.initBlobService();
     } catch (error) {
         return Promise.reject(error.message);
     }
 
-    var params = {
-        Bucket: this.config.bucket,
-        Key: pathToDelete
-    };
-
-    return this.s3Client.deleteObject(params).promise()
+    return this.deleteBlob(this.config.container, filepath)
         .tap(function() {
-            console.log('ghost-s3', 'Deleted file: ' + pathToDelete);
+            console.log('ghost-azure-blob-storage', 'Deleted file: ' + filepath);
         })
-        .then(function(results) {
+        .then(function() {
             return Promise.resolve(true);
         })
         .catch(function(err) {
+            console.error("ghost-azure-blob-storage", err);
             return Promise.resolve(false);
         });
 };
 
-module.exports = S3Store;
+module.exports = AzureBlobStore;
