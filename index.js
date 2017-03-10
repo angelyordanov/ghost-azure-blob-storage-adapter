@@ -53,6 +53,10 @@ AzureBlobStore.prototype.initBlobService = function() {
     throw Error('ghost-azure-blob-storage is not configured');
 };
 
+AzureBlobStore.prototype.normalizePath = function(path) {
+    return path.replace(/\\/g, '/')
+};
+
 // Implement BaseStore::save(image, targetDir)
 AzureBlobStore.prototype.save = function(image, targetDir) {
     var self = this;
@@ -65,22 +69,22 @@ AzureBlobStore.prototype.save = function(image, targetDir) {
         return Promise.reject(error.message);
     }
 
-    var filename;
+    var filepath;
     return this.getUniqueFileName(this, image, targetDir)
         .then(function(result) {
-            filename = result;
+            filepath = self.normalizePath(result);
         })
         .then(function () {
             return self.createContainerIfNotExists(self.config.container, { publicAccessLevel: 'blob' });
         })
         .then(function () {
-            return self.createBlockBlobFromLocalFile(self.config.container, filename, image.path);
+            return self.createBlockBlobFromLocalFile(self.config.container, filepath, image.path);
         })
         .tap(function() {
             console.log('ghost-azure-blob-storage', 'Temp uploaded file path: ' + image.path);
         })
         .then(function() {
-            var url = protocol + '://' + self.config.storageAccount + '.' + domain + '/' + self.config.container + '/' + filename;
+            var url = protocol + '://' + self.config.storageAccount + '.' + domain + '/' + self.config.container + '/' + filepath;
             return Promise.resolve(url);
         })
         .catch(function(err) {
@@ -89,15 +93,16 @@ AzureBlobStore.prototype.save = function(image, targetDir) {
         });
 };
 
-// Implement BaseStore::save(filename)
-AzureBlobStore.prototype.exists = function(filename) {
+// Implement BaseStore::save(filepath)
+AzureBlobStore.prototype.exists = function(filepath) {
     try {
         this.initBlobService();
     } catch (error) {
         return Promise.reject(error.message);
     }
 
-    return this.getBlobProperties(this.config.container, filename)
+    filepath = this.normalizePath(filepath);
+    return this.getBlobProperties(this.config.container, filepath)
         .spread(function(properties, status) {
             return Promise.resolve(status.isSuccessful);
         })
@@ -134,6 +139,7 @@ AzureBlobStore.prototype.serve = function(options) {
     }
 
     return function (req, res, next) {
+        // trim the leading slash
         var filepath = req.path.replace(/^\//, '');
 
         return this.getBlobProperties(this.config.container, filepath)
@@ -166,6 +172,7 @@ AzureBlobStore.prototype.delete = function(filename, targetDir) {
     targetDir = targetDir || this.getTargetDir();
 
     var filepath = path.join(targetDir, filename);
+    filepath = this.normalizePath(filepath);
 
     try {
         this.initBlobService();
